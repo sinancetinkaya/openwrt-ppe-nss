@@ -1,3 +1,24 @@
+This is my personal build of [@JuliusBairaktaris](https://github.com/JuliusBairaktaris)'s [openwrt-nss-edma](https://github.com/JuliusBairaktaris/openwrt-nss-edma) with Zyxel NBG7815-specific patches, and nothing else.<br>
+<br>
+
+<font color="red">**WARNING:**</font><br>
+I merged the mmcblk0p10 and mmcblk0p11 partitions to increase the `/overlay` partition size to 3.4 GB. The filesystem must be expanded to the full partition once by running:<br>
+<br>
+`resize2fs /dev/mmcblk0p10`
+<br>
+<br>
+<del>
+Because I am using an unofficial, non-standard `/overlay` partition, sysupgrade does not format it during flashing if `Keep settings and retain the current configuration` is selected. This will preserve old settings and packages, which can cause problems.</del><br>
+<br>
+<del>The best way to flash this firmware is:</del><br>
+<br>
+<del>1. Back up your settings.</del><br>
+<del>2. Flash the firmware with `Keep settings and retain the current configuration` unchecked</del><br>
+<del>3. Restore your settings</del><br>
+</del>
+
+---
+## Original README ⏬
 # OpenWrt with NSS hardware offload for IPQ807x and IPQ60xx
 
 > [!IMPORTANT]
