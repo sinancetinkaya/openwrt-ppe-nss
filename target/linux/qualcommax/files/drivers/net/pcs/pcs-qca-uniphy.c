@@ -346,32 +346,88 @@ static void qca_uniphy_pcs_get_state_hsgmii(struct qca_uniphy *uniphy,
 	state->an_complete = state->link;
 }
 
-static void qca_uniphy_pcs_get_state_usxgmii(struct qca_uniphy *uniphy,
-					     struct phylink_link_state *state)
+static void qca_uniphy_pcs_dump_an_status(struct qca_uniphy *uniphy,
+					    const char *tag, u32 kr_sts, u32 an_sts)
 {
-	unsigned int val;
+	static u32 last_kr_sts, last_an_sts;
+	static bool have_last;
+	static int last_tag;
+	int this_tag = !strcmp(tag, "up");
+
+	if (have_last && last_tag == this_tag &&
+	    last_kr_sts == kr_sts && last_an_sts == an_sts)
+		return;
+
+	dev_info_ratelimited(uniphy->dev,
+			     "USXGMII %s: KR_STS1=%#x AN_INTR_STS=%#x "
+			     "cl37=%u usxg_link=%u speed_code=%u\n",
+			     tag, kr_sts, an_sts,
+			     !!(an_sts & XPCS_USXG_AN_COMPLETED),
+			     !!(an_sts & XPCS_USXG_AN_LINK_STS),
+			     (u32)FIELD_GET(XPCS_USXG_AN_SPEED_MASK, an_sts));
+
+	last_kr_sts = kr_sts;
+	last_an_sts = an_sts;
+	last_tag = this_tag;
+	have_last = true;
+}
+
+static void qca_uniphy_pcs_clear_an_status(struct qca_uniphy *uniphy)
+{
+	static u32 last_an_sts;
+	static bool have_last;
+	u32 an_sts;
 	int ret;
 
-	ret = regmap_read(uniphy->regmap, XPCS_KR_STS1, &val);
+	ret = regmap_read(uniphy->regmap, XPCS_MII_AN_INTR_STS, &an_sts);
+	if (!ret && an_sts) {
+		if (have_last && last_an_sts == an_sts)
+			return;
+
+		dev_info_ratelimited(uniphy->dev,
+			     "USXGMII clear stale AN_INTR_STS=%#x before relink\n",
+			     an_sts);
+		last_an_sts = an_sts;
+		have_last = true;
+		regmap_write(uniphy->regmap, XPCS_MII_AN_INTR_STS, an_sts);
+	}
+}
+
+static void qca_uniphy_pcs_get_state_usxgmii(struct qca_uniphy *uniphy,
+						    struct phylink_link_state *state)
+{
+	u32 kr_sts, an_sts;
+	int ret;
+
+	ret = regmap_read(uniphy->regmap, XPCS_KR_STS1, &kr_sts);
 	if (ret) {
-		state->link = 0;
+		state->link = false;
 		return;
 	}
 
-	state->link = !!(val & XPCS_KR_STS1_PLU);
-
-	if (!state->link)
-		return;
-
-	ret = regmap_read(uniphy->regmap, XPCS_MII_AN_INTR_STS, &val);
-	if (ret) {
-		state->link = 0;
+	state->link = !!(kr_sts & XPCS_KR_STS1_PLU);
+	if (!state->link) {
+		ret = regmap_read(uniphy->regmap, XPCS_MII_AN_INTR_STS, &an_sts);
+		if (!ret)
+			qca_uniphy_pcs_dump_an_status(uniphy, "down", kr_sts, an_sts);
 		return;
 	}
 
-	state->an_complete = !!(val & XPCS_USXG_AN_LINK_STS);
+	ret = regmap_read(uniphy->regmap, XPCS_MII_AN_INTR_STS, &an_sts);
+	if (ret) {
+		state->link = false;
+		return;
+	}
 
-	switch (FIELD_GET(XPCS_USXG_AN_SPEED_MASK, val)) {
+	qca_uniphy_pcs_dump_an_status(uniphy, "up", kr_sts, an_sts);
+
+	/* XPCS_USXG_AN_LINK_STS is a status bit for the link/AN result,
+	 * not the CL37 completion interrupt. The completion event is bit 0 of
+	 * the same register and is the condition that marks AN as finished.
+	 */
+	state->an_complete = !!(an_sts & XPCS_USXG_AN_COMPLETED);
+
+	switch (FIELD_GET(XPCS_USXG_AN_SPEED_MASK, an_sts)) {
 	case XPCS_USXG_AN_SPEED_10000:
 		state->speed = SPEED_10000;
 		break;
@@ -821,7 +877,8 @@ static int uniphy_link_up_usxgmii(struct phylink_pcs *pcs, int speed)
 {
 	struct qca_uniphy_pcs *upcs = to_qca_uniphy_pcs(pcs);
 	struct qca_uniphy *uniphy = upcs->uniphy;
-	unsigned int val, uniphy_rate;
+	unsigned int val, mii_ctrl;
+	unsigned long uniphy_rate;
 	int ret;
 
 	switch (speed) {
@@ -858,6 +915,17 @@ static int uniphy_link_up_usxgmii(struct phylink_pcs *pcs, int speed)
 	clk_set_rate(uniphy->clks[port_tx_clk_idx(upcs)].clk, uniphy_rate);
 
 	/* Configure XPCS speed */
+	/* Clear stale AN interrupt/status bits before forcing a new
+	 * link-up sequence; otherwise a previous completion or speed code can
+	 * persist across a link-down and be reused as the next 10G result.
+	 */
+	qca_uniphy_pcs_clear_an_status(uniphy);
+	ret = regmap_read(uniphy->regmap, XPCS_MII_CTRL, &mii_ctrl);
+	if (!ret)
+		dev_info_ratelimited(uniphy->dev,
+			     "USXGMII relink: XPCS_MII_CTRL before=%#x desired=%#x\n",
+			     mii_ctrl, (unsigned int)(val | XPCS_DUPLEX_FULL));
+
 	ret = regmap_update_bits(uniphy->regmap, XPCS_MII_CTRL,
 				 XPCS_SPEED_MASK, val | XPCS_DUPLEX_FULL);
 	if (ret)
